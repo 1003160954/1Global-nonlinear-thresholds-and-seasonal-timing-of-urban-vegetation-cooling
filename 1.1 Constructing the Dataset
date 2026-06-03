@@ -36,7 +36,7 @@ ERA_DEG  = 0.10
 
 # Downsample factor inside rasterio read.
 # NOTE: if you set SPATIAL_SUBSAMPLE>1, your effective resolution becomes FINE_DEG*SPATIAL_SUBSAMPLE.
-SPATIAL_SUBSAMPLE = 2
+SPATIAL_SUBSAMPLE = 1
 
 # After ERA5-guided sampling, additional random sampling usually unnecessary.
 SAMPLE_FRAC = 1.0
