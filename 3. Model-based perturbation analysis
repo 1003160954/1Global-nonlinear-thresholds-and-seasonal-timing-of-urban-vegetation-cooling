@@ -1,45 +1,11 @@
-# ============================================================
-# Dependencies
-# ============================================================
+# ================== 依赖 ==================
 # !pip -q install catboost
-
-import os
-import json
-import numpy as np
-import pandas as pd
+import os, json, numpy as np, pandas as pd
 import matplotlib.pyplot as plt
 from catboost import CatBoostRegressor
 
-
-# ============================================================
-# User settings
-# ============================================================
-
-MODEL_DIR = "/content/drive/MyDrive/anature_revised/Trainmodel/"  # ← 改成你的模型目录
-
-# ---------- speed settings ----------
-MAX_SAMPLES_PER_SUBSET = 100000   # 调试可改 20000 / 50000；正式建议 100000
-MAX_DELTA_POINTS = 51            # 按你原来的画法保留 201 个点
-PCT_STEP = 0.02                   # 按你原来的 1% mean_pos
-Q_HI = 0.95
-RANDOM_STATE = 42
-
-# ---------- uncertainty settings ----------
-N_BOOTSTRAP = 200                 # 调试可改 100
-BOOTSTRAP_SAMPLE_SIZE = 10000     # 每次 bootstrap 抽样量，越大越稳但越慢
-CI_LEVEL = 95
-
-# ---------- EVI x-axis setting ----------
-EVI_XMAX = 0.60                   # EVI 的 Δ 横轴延伸到 0.6
-
-# ---------- output ----------
-OUT_JSON_NAME = "veg_sensitivity_positive_1pct_withCI_extendEVI06.json"
-OUT_FIG_NAME = "veg_sensitivity_positive_1pct_withCI_extendEVI06.png"
-
-
-# ============================================================
-# Paths
-# ============================================================
+# ================== 路径参数 ==================
+MODEL_DIR = "/content/GZ_model_20260303_100809"  # ← 改为你的目录
 
 model_path     = os.path.join(MODEL_DIR, "catboost_model.cbm")
 channels_path  = os.path.join(MODEL_DIR, "channels.npy")
@@ -48,581 +14,227 @@ y_valid_path   = os.path.join(MODEL_DIR, "y_valid.npy")
 
 assert os.path.exists(model_path), f"未找到模型: {model_path}"
 assert os.path.exists(channels_path), f"未找到特征文件: {channels_path}"
-assert os.path.exists(X_valid_path), f"未找到 X_valid: {X_valid_path}"
-assert os.path.exists(y_valid_path), f"未找到 y_valid: {y_valid_path}"
+assert os.path.exists(X_valid_path) and os.path.exists(y_valid_path), "缺少验证集文件"
 
-
-# ============================================================
-# Load model and validation data
-# ============================================================
-
-print("Loading model and validation data...")
-
-model = CatBoostRegressor()
+# ================== 载入模型与数据 ==================
+model    = CatBoostRegressor()
 model.load_model(model_path)
-
 channels = np.load(channels_path, allow_pickle=True).astype(object).tolist()
-X_valid = np.load(X_valid_path)
-y_valid = np.load(y_valid_path).astype(np.float32)
-
+X_valid  = np.load(X_valid_path)
+y_valid  = np.load(y_valid_path).astype(np.float32)
 Xv = pd.DataFrame(X_valid, columns=channels)
 
-print("X_valid shape:", Xv.shape)
-print("y_valid shape:", y_valid.shape)
-print("Number of features:", len(channels))
-
-
-# ============================================================
-# Vegetation features
-# ============================================================
-
+# 仅分析 EVI / LAI
 veg_features = [f for f in ["EVI.EVI", "LAI.LAI"] if f in Xv.columns]
+assert veg_features, f"验证集未包含 EVI.EVI/LAI.LAI，这些列在：{Xv.columns.tolist()}"
 
-assert veg_features, (
-    "验证集未包含 EVI.EVI 或 LAI.LAI。"
-    f"当前列名为: {Xv.columns.tolist()}"
-)
-
-print("Vegetation features used:", veg_features)
-
-
-# ============================================================
-# Clean EVI / LAI
-# ============================================================
-
-def sanitize_veg(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Clean vegetation variables:
-    - non-finite values -> 0
-    - EVI clipped to [0, 1]
-    - LAI clipped to [0, 8]
-    """
+# ================== 清理：EVI/LAI 负值→0，并裁剪上限 ==================
+def sanitize_veg(df: pd.DataFrame):
     if "EVI.EVI" in df.columns:
         x = df["EVI.EVI"].to_numpy(copy=True)
         x[~np.isfinite(x)] = np.nan
         x = np.nan_to_num(x, nan=0.0)
-        x = np.clip(x, 0.0, 1.0)
-        df["EVI.EVI"] = x.astype(np.float32)
-
+        x = np.clip(x, 0.0, 1.0)  # EVI 合理范围
+        df["EVI.EVI"] = x
     if "LAI.LAI" in df.columns:
         x = df["LAI.LAI"].to_numpy(copy=True)
         x[~np.isfinite(x)] = np.nan
         x = np.nan_to_num(x, nan=0.0)
-        x = np.clip(x, 0.0, 8.0)
-        df["LAI.LAI"] = x.astype(np.float32)
-
+        x = np.clip(x, 0.0, 8.0)  # LAI 上限可按你的数据调整
+        df["LAI.LAI"] = x
     return df
-
 
 Xv = sanitize_veg(Xv)
 
-
-# ============================================================
-# Temperature subset partition
-# ============================================================
-
+# ================== 分位数分区（高温/中温） ==================
 q80 = np.quantile(y_valid, 0.80)
 q60 = np.quantile(y_valid, 0.60)
-
 idx_all  = np.ones_like(y_valid, dtype=bool)
 idx_high = y_valid >= q80
 idx_mid  = (y_valid < q80) & (y_valid >= q60)
 
 subsets = {
-    "All": idx_all,
+    "All":  idx_all,
     "High Temp (≥P80)": idx_high,
     "Mid Temp ([P60,P80))": idx_mid
 }
 
-print("\nTemperature thresholds:")
-print(f"  P60 = {q60:.3f}")
-print(f"  P80 = {q80:.3f}")
-
-print("\nSubset sizes:")
-for name, mask in subsets.items():
-    print(f"  {name}: {int(mask.sum())}")
-
-
-# ============================================================
-# Utility functions
-# ============================================================
-
+# ================== 工具函数 ==================
 def clip_feature(name, arr):
-    """
-    Clip perturbed feature to valid physical range.
-    """
+    """确保扰动后仍在合理范围"""
     if name == "EVI.EVI":
         return np.clip(arr, 0.0, 1.0)
-
     if name == "LAI.LAI":
         return np.clip(arr, 0.0, 8.0)
-
     return arr
 
-
-def positive_deltas_by_1pct_steps(
-    x_series,
-    feat=None,
-    hi=0.95,
-    pct_step=0.01,
-    max_points=201,
-    evi_xmax=0.60
-):
+def positive_deltas_by_1pct_steps(x_series, hi=0.95, pct_step=0.001, max_points=201):
     """
-    Positive perturbation Δ.
-
-    EVI:
-        Δ from 0 to 0.60, so the EVI panel x-axis is extended to 0.6.
-
-    LAI:
-        Δ from 0 to Q95 - mean_pos, following your original logic.
+    仅正向扰动：Δ从 0 开始，以 1%*mean_pos 为步长，直到 (Q95 - mean_pos)。
+    - mean_pos: 仅对 x>0 样本求均值
+    - 若范围过小，兜底给一个很小的正范围
     """
     x = x_series.to_numpy()
     pos_mask = np.isfinite(x) & (x > 0)
-
     if pos_mask.sum() == 0:
-        return np.array([0.0, 1e-3], dtype=np.float32)
+        # 全部非正/缺失，返回极小扰动
+        return np.array([0.0, 1e-3], dtype=float)
 
     mean_pos = float(np.mean(x[pos_mask]))
-    q_hi = float(np.quantile(x[pos_mask], hi))
+    q_hi     = float(np.quantile(x[pos_mask], hi))
+    max_inc  = max(0.0, 4)
 
-    if feat == "EVI.EVI":
-        max_inc = float(evi_xmax)
-    else:
-        max_inc = max(0.0, q_hi - mean_pos)
+    step = max(1e-6, pct_step * max(mean_pos, 1e-6))  # 1%*mean_pos
+    if max_inc < step:  # 太窄：给两个点
+        return np.array([0.0, max(1e-4, max_inc)], dtype=float)
 
-    if max_inc <= 1e-8:
-        return np.array([0.0, 1e-4], dtype=np.float32)
-
-    step = max(1e-6, pct_step * max(mean_pos, 1e-6))
-
+    # 生成 0→max_inc 的等差序列，控制点数上限
     n_steps = int(np.floor(max_inc / step)) + 1
     n_steps = min(n_steps, max_points)
-
-    deltas = np.linspace(0.0, max_inc, n_steps, dtype=np.float32)
+    deltas = np.linspace(0.0, step*(n_steps-1), n_steps, dtype=float)
     return deltas
 
-
-def bootstrap_curve_ci(
-    response_matrix,
-    n_boot=200,
-    sample_size=10000,
-    ci_level=95,
-    random_state=42
-):
+def perturb_and_response_positive(model, X_df, y_base, feat, deltas):
     """
-    Bootstrap confidence interval for mean response curve.
-
-    response_matrix shape:
-        [n_delta, n_samples]
-
-    Each column is one sample's perturbation-response trajectory.
+    仅对 baseline>0 的样本进行正向扰动，返回每个 Δ 下: mean(pred_after) - mean(y_base)
     """
-    n_delta, n_samples = response_matrix.shape
-
-    if n_samples == 0:
-        nan_arr = np.full(n_delta, np.nan, dtype=np.float32)
-        return nan_arr, nan_arr
-
-    sample_size = min(sample_size, n_samples)
-    rng = np.random.default_rng(random_state)
-
-    boot_means = np.empty((n_boot, n_delta), dtype=np.float32)
-
-    for b in range(n_boot):
-        idx = rng.integers(0, n_samples, size=sample_size)
-        boot_means[b, :] = response_matrix[:, idx].mean(axis=1)
-
-    alpha = (100.0 - ci_level) / 2.0
-
-    lower = np.percentile(boot_means, alpha, axis=0).astype(np.float32)
-    upper = np.percentile(boot_means, 100.0 - alpha, axis=0).astype(np.float32)
-
-    return lower, upper
-
-
-def perturb_and_response_positive_with_ci(
-    model,
-    X_df,
-    feat,
-    deltas,
-    max_samples=100000,
-    n_boot=200,
-    bootstrap_sample_size=10000,
-    ci_level=95,
-    random_state=42
-):
-    """
-    Fast perturbation-response calculation with bootstrap CI.
-
-    Core logic:
-    - Only use samples where baseline vegetation feature > 0.
-    - Randomly sample at most max_samples rows.
-    - Baseline = model prediction under original feature values.
-    - Response = pred_after_perturbation - pred_baseline.
-    - CI = bootstrap uncertainty of the mean response curve.
-    """
+    # 仅在该特征 baseline>0 的样本上计算
     if feat not in X_df.columns:
-        empty = np.array([], dtype=np.float32)
-        return empty, empty, empty, 0
-
-    feat_idx = X_df.columns.get_loc(feat)
-    x_feat = X_df[feat].to_numpy()
-
-    base_mask = np.isfinite(x_feat) & (x_feat > 0)
-
+        return np.array([], dtype=float)
+    base_mask = np.isfinite(X_df[feat].to_numpy()) & (X_df[feat].to_numpy() > 0)
     if not base_mask.any():
-        empty = np.array([], dtype=np.float32)
-        return empty, empty, empty, 0
+        return np.array([], dtype=float)
 
-    valid_idx = np.where(base_mask)[0]
+    X_sub = X_df.loc[base_mask]
+    y_sub = y_base[base_mask]
+    base  = float(np.nanmean(y_sub)) if y_sub.size else np.nan
 
-    if len(valid_idx) > max_samples:
-        rng = np.random.default_rng(random_state)
-        valid_idx = rng.choice(valid_idx, size=max_samples, replace=False)
-
-    # Convert to writable contiguous numpy array
-    X_base = X_df.iloc[valid_idx].to_numpy(dtype=np.float32, copy=True)
-    X_base = np.ascontiguousarray(X_base, dtype=np.float32)
-
-    X_work = X_base.copy()
-    original_feat = X_base[:, feat_idx].copy()
-
-    # Baseline prediction under original features
-    y0_pred = model.predict(X_base).astype(np.float32)
-
-    n_delta = len(deltas)
-    n_used = X_base.shape[0]
-
-    response_matrix = np.empty((n_delta, n_used), dtype=np.float32)
-
-    for k, d in enumerate(deltas):
-        X_work[:, feat_idx] = clip_feature(feat, original_feat + d).astype(np.float32)
-        y_pred = model.predict(X_work).astype(np.float32)
-        response_matrix[k, :] = y_pred - y0_pred
-
-    mean_curve = response_matrix.mean(axis=1).astype(np.float32)
-
-    lower_curve, upper_curve = bootstrap_curve_ci(
-        response_matrix=response_matrix,
-        n_boot=n_boot,
-        sample_size=bootstrap_sample_size,
-        ci_level=ci_level,
-        random_state=random_state
-    )
-
-    return mean_curve, lower_curve, upper_curve, int(n_used)
-
+    res = []
+    for d in deltas:
+        X_mod = X_sub.copy()
+        X_mod[feat] = clip_feature(feat, X_mod[feat].to_numpy() + d)
+        y_pred = model.predict(X_mod.to_numpy())
+        res.append(float(np.nanmean(y_pred) - base))
+    return np.array(res, dtype=float)
 
 def summarize_curve(deltas, response):
     """
-    Summary metrics for perturbation-response curve:
-    - min_cooling: strongest cooling response, i.e., most negative ΔLST
-    - at_delta: Δ where strongest cooling occurs
-    - sat80_delta: minimum Δ reaching 80% of strongest cooling
-    - left_slope: initial slope
-    - right_slope: terminal slope
+    摘要指标（正向扰动）：
+    - min_cooling: 最强冷却（负值越小越好），及对应 Δ
+    - sat80_delta: 达到最强冷却 80% 的最小 Δ（接近阈值/饱和点）
+    - 左右端点斜率（这里右端是正向最大扰动端）
     """
-    out = {
-        "min_cooling": np.nan,
-        "at_delta": np.nan,
-        "sat80_delta": np.nan,
-        "left_slope": np.nan,
-        "right_slope": np.nan
-    }
-
+    out = {"min_cooling": np.nan, "at_delta": np.nan, "sat80_delta": np.nan,
+           "left_slope": np.nan, "right_slope": np.nan}
     if response.size == 0 or deltas.size == 0:
         return out
 
-    if np.all(~np.isfinite(response)):
-        return out
-
+    # 最小值
     i_min = int(np.nanargmin(response))
-
     out["min_cooling"] = float(response[i_min])
-    out["at_delta"] = float(deltas[i_min])
+    out["at_delta"]    = float(deltas[i_min])
 
-    target = 0.8 * response[i_min]
+    # 80%饱和点（离0最近且 response <= 0.8*min）
+    target = 0.8 * response[i_min]  # min 为负值，0.8*min 更接近0
     sat_idx = np.where(response <= target)[0]
-
     if sat_idx.size:
         nearest = sat_idx[np.argmin(np.abs(deltas[sat_idx]))]
         out["sat80_delta"] = float(deltas[nearest])
 
+    # 端点斜率（正向端）
     if deltas.size >= 3:
-        denom_left = deltas[1] - deltas[0]
-        denom_right = deltas[-1] - deltas[-2]
-
-        if abs(denom_left) > 1e-12:
-            out["left_slope"] = float((response[1] - response[0]) / denom_left)
-
-        if abs(denom_right) > 1e-12:
-            out["right_slope"] = float((response[-1] - response[-2]) / denom_right)
-
+        left_slope  = (response[1] - response[0]) / (deltas[1] - deltas[0])
+        right_slope = (response[-1] - response[-2]) / (deltas[-1] - deltas[-2])
+        out["left_slope"]  = float(left_slope)
+        out["right_slope"] = float(right_slope)
     return out
 
-
-# ============================================================
-# Paper-style plotting parameters
-# ============================================================
-
+# ================== 论文风格绘图参数（不改变结果，只影响显示） ==================
 plt.rcParams.update({
     "axes.spines.top": False,
     "axes.spines.right": False,
     "axes.linewidth": 1.2,
-    "font.size": 11,
-    "legend.frameon": False
+    "font.size": 11
 })
 
 style_map = {
-    "All": dict(
-        color="black",
-        linewidth=2.5,
-        linestyle="-"
-    ),
-    "High Temp (≥P80)": dict(
-        color="#d62728",
-        linewidth=2.0,
-        linestyle="--"
-    ),
-    "Mid Temp ([P60,P80))": dict(
-        color="#1f77b4",
-        linewidth=2.0,
-        linestyle="-."
-    )
+    "All":  dict(color="black", linewidth=2.5, linestyle="-"),
+    "High Temp (≥P80)": dict(color="#d62728", linewidth=2.0, linestyle="--"),
+    "Mid Temp ([P60,P80))": dict(color="#1f77b4", linewidth=2.0, linestyle="-.")
 }
 
 
-# ============================================================
-# Plotting and measurement
-# ============================================================
-
-results = {}
+# ================== 绘图与度量 ==================
+results = {}   # 保存每个特征在不同子集下的统计量
 
 n = len(veg_features)
 ncols = 2
 nrows = int(np.ceil(n / ncols))
-
-fig, axes = plt.subplots(
-    nrows,
-    ncols,
-    figsize=(6 * ncols, 5 * nrows)
-)
-
+fig, axes = plt.subplots(nrows, ncols, figsize=(6*ncols, 5*nrows))
 axes = np.atleast_1d(axes).flatten()
 
 for i, feat in enumerate(veg_features):
-    print(f"\nProcessing feature: {feat}")
-
     ax = axes[i]
 
-    # ------------------------------------------------------------
-    # EVI: Δ extends to 0.6
-    # LAI: Δ uses Q95 - mean_pos
-    # ------------------------------------------------------------
-    deltas = positive_deltas_by_1pct_steps(
-        Xv[feat],
-        feat=feat,
-        hi=Q_HI,
-        pct_step=PCT_STEP,
-        max_points=MAX_DELTA_POINTS,
-        evi_xmax=EVI_XMAX
-    )
-
-    print(f"  Number of delta points: {len(deltas)}")
-    print(f"  Delta range: {float(deltas.min()):.5f} to {float(deltas.max()):.5f}")
+    # 正向扰动 Δ：0 → Q95−mean_pos，步长=1%*mean_pos（保持与你原始设置一致）
+    deltas = positive_deltas_by_1pct_steps(Xv[feat], hi=0.95, pct_step=0.01, max_points=201)
 
     curves = {}
-    ci_lower = {}
-    ci_upper = {}
-    n_used_dict = {}
-
-    for j, (name, mask) in enumerate(subsets.items()):
-        print(f"  Running subset: {name}")
-
+    for name, mask in subsets.items():
         X_sub = Xv.loc[mask]
+        y_sub = y_valid[mask]
+        resp  = perturb_and_response_positive(model, X_sub, y_sub, feat, deltas)
+        curves[name] = resp
 
-        mean_curve, lower_curve, upper_curve, n_used = perturb_and_response_positive_with_ci(
-            model=model,
-            X_df=X_sub,
-            feat=feat,
-            deltas=deltas,
-            max_samples=MAX_SAMPLES_PER_SUBSET,
-            n_boot=N_BOOTSTRAP,
-            bootstrap_sample_size=BOOTSTRAP_SAMPLE_SIZE,
-            ci_level=CI_LEVEL,
-            random_state=RANDOM_STATE + i * 100 + j
-        )
-
-        curves[name] = mean_curve
-        ci_lower[name] = lower_curve
-        ci_upper[name] = upper_curve
-        n_used_dict[name] = n_used
-
-        print(f"    samples used: {n_used}")
-
-        if mean_curve.size:
-            print(
-                f"    response range: "
-                f"{float(np.nanmin(mean_curve)):.4f} to {float(np.nanmax(mean_curve)):.4f}"
-            )
-
-    # ------------------------------------------------------------
-    # Plot response curves + CI
-    # Keep your original plotting style:
-    # - line curves
-    # - no background grid
-    # - density histogram on right axis
-    # ------------------------------------------------------------
+    # 画响应曲线（去网格线、改线型颜色）
     for name, resp in curves.items():
         if resp.size:
-            style = style_map.get(name, {})
+            ax.plot(deltas, resp, label=name, **style_map.get(name, {}))
 
-            line = ax.plot(
-                deltas,
-                resp,
-                label=name,
-                **style
-            )[0]
-
-            color = line.get_color()
-
-            ax.fill_between(
-                deltas,
-                ci_lower[name],
-                ci_upper[name],
-                color=color,
-                alpha=0.14,
-                linewidth=0
-            )
-
-    ax.axhline(
-        0,
-        color="gray",
-        linestyle=":",
-        linewidth=1
-    )
-
-    ax.set_title(
-        f"Sensitivity of {feat} (Positive Δ @ 1% steps of mean>0)",
-        fontsize=12
-    )
-
+    ax.axhline(0, color="gray", linestyle=":", linewidth=1)
+    ax.set_title(f"Sensitivity of {feat} (Positive Δ @ 1% steps of mean>0)", fontsize=12)
     ax.set_xlabel(f"{feat} positive perturbation (Δ ≥ 0)")
     ax.set_ylabel("Δ Predicted LST (°C)")
+    # ❌ 不要网格线：不调用 ax.grid()
 
-    # No background grid
-    ax.grid(False)
+    ax.legend(frameon=False)
 
-    # EVI x-axis fixed to 0.6
-    if feat == "EVI.EVI":
-        ax.set_xlim(0, 1)
-
-    ax.legend(
-        loc="lower center",
-        bbox_to_anchor=(0.5, 1.02),
-        ncol=3,
-        frameon=False
-    )
-
-    # ------------------------------------------------------------
-    # Keep density histogram on the right axis
-    # ------------------------------------------------------------
+    # 分布直方图（右轴，仅>0部分）
     ax2 = ax.twinx()
-
     vals = Xv[feat].to_numpy()
     vals = vals[np.isfinite(vals) & (vals > 0)]
-
     if vals.size:
-        ax2.hist(
-            vals,
-            bins=30,
-            alpha=0.18,
-            density=True,
-            color="#9ecae1"
-        )
-
+        ax2.hist(vals, bins=30, alpha=0.18, density=True)
     ax2.set_ylabel("Density", color="gray")
-    ax2.tick_params(axis="y", labelcolor="gray")
-    ax2.grid(False)
+    ax2.tick_params(axis='y', labelcolor='gray')
 
-    # ------------------------------------------------------------
-    # Save statistics
-    # ------------------------------------------------------------
-    results[feat] = {}
+    # 统计指标
+    results[feat] = {name: summarize_curve(deltas, resp) for name, resp in curves.items()}
 
-    for name, resp in curves.items():
-        summary = summarize_curve(deltas, resp)
-
-        summary["n_used"] = int(n_used_dict[name])
-        summary["n_delta"] = int(len(deltas))
-        summary["delta_min"] = float(np.nanmin(deltas))
-        summary["delta_max"] = float(np.nanmax(deltas))
-        summary["n_bootstrap"] = int(N_BOOTSTRAP)
-        summary["bootstrap_sample_size"] = int(
-            min(BOOTSTRAP_SAMPLE_SIZE, max(n_used_dict[name], 1))
-        )
-
-        results[feat][name] = {
-            "summary": summary,
-            "deltas": deltas.tolist(),
-            "mean_curve": resp.tolist(),
-            "ci_lower": ci_lower[name].tolist(),
-            "ci_upper": ci_upper[name].tolist()
-        }
-
-
-# Remove unused axes
-for j in range(i + 1, len(axes)):
+# 删除多余子图
+for j in range(i+1, len(axes)):
     fig.delaxes(axes[j])
 
-
 plt.suptitle(
-    "EVI/LAI Sensitivity "
-    f"(Positive Perturbation, 1% Steps of Mean>0, {CI_LEVEL}% Bootstrap CI)",
+    "EVI/LAI Sensitivity (Positive Perturbation, 1% Steps of Mean>0, Range up to Q95-mean)",
     fontsize=14
 )
-
 plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-
-# Save figure
-out_fig = os.path.join(MODEL_DIR, OUT_FIG_NAME)
-plt.savefig(out_fig, dpi=300, bbox_inches="tight")
-
 plt.show()
 
-print("✅ 已保存图片：", out_fig)
-
-
-# ============================================================
-# Export statistics
-# ============================================================
-
-out_json = os.path.join(MODEL_DIR, OUT_JSON_NAME)
-
-with open(out_json, "w", encoding="utf-8") as f:
+# ================== 导出统计量（可写论文/表格） ==================
+out_json = os.path.join(MODEL_DIR, "veg_sensitivity_positive_1pct.json")
+with open(out_json, "w") as f:
     json.dump(results, f, indent=2, ensure_ascii=False)
-
 print("✅ 已导出统计量：", out_json)
 
-
-# ============================================================
-# Print summary
-# ============================================================
-
+# 简要打印
 for feat in veg_features:
     print(f"\n== {feat} ==")
-
     for name in ["All", "High Temp (≥P80)", "Mid Temp ([P60,P80))"]:
         if name in results[feat]:
-            r = results[feat][name]["summary"]
-
+            r = results[feat][name]
             print(
-                f"  [{name}] "
-                f"n={r['n_used']} | "
-                f"min_cooling={r['min_cooling']:.3f} °C @ Δ={r['at_delta']:.4f} | "
-                f"sat80Δ={r['sat80_delta']:.4f} | "
-                f"slopes=({r['left_slope']:.3f},{r['right_slope']:.3f}) | "
-                f"delta_range=({r['delta_min']:.4f},{r['delta_max']:.4f}) | "
-                f"bootstrap={r['n_bootstrap']} × {r['bootstrap_sample_size']}"
+                f"  [{name}] min_cooling={r['min_cooling']:.3f} °C @ Δ={r['at_delta']:.4f} | "
+                f"sat80Δ={r['sat80_delta']:.4f} | slopes=({r['left_slope']:.3f},{r['right_slope']:.3f})"
             )
